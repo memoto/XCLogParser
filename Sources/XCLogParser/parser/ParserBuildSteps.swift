@@ -305,7 +305,11 @@ public final class ParserBuildSteps {
 
     private func parseWarningsAndErrorsFromLogSection(_ logSection: IDEActivityLogSection, forType type: DetailStepType)
         -> [String: [Notice]]? {
-        let notices = Notice.parseFromLogSection(logSection, forType: type, truncLargeIssues: truncLargeIssues)
+        let notices = Notice.parseFromLogSection(logSection,
+                                                 forType: type,
+                                                 truncLargeIssues: truncLargeIssues,
+                                                 omitWarningsDetails: omitWarningsDetails,
+                                                 omitNotesDetails: omitNotesDetails)
         return ["warnings": notices.getWarnings(),
                 "errors": notices.getErrors(),
                 "notes": notices.getNotes()]

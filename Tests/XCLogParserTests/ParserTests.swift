@@ -288,6 +288,32 @@ note: use 'updatedDoSomething' instead\r doSomething()\r        ^~~~~~~~~~~\r   
     ServicesPlist.build/Script-7AD9607C371622036A6BC748.sh
     """
 
+    private func getFakeLogSection(messages: [IDEActivityLogMessage],
+                                   text: String,
+                                   location: DVTDocumentLocation) -> IDEActivityLogSection {
+        let timestamp = Date().timeIntervalSinceReferenceDate
+        return IDEActivityLogSection(sectionType: 1,
+                                     domainType: "",
+                                     title: "",
+                                     signature: "",
+                                     timeStartedRecording: timestamp,
+                                     timeStoppedRecording: timestamp,
+                                     subSections: [],
+                                     text: text,
+                                     messages: messages,
+                                     wasCancelled: false,
+                                     isQuiet: true,
+                                     wasFetchedFromCache: true,
+                                     subtitle: "",
+                                     location: location,
+                                     commandDetailDesc: "",
+                                     uniqueIdentifier: "uniqueIdentifier",
+                                     localizedResultString: "",
+                                     xcbuildSignature: "",
+                                     attachments: [],
+                                     unknown: 0)
+    }
+
     private func getFakeIDEActivityLogWithMessages(_ messages: [IDEActivityLogMessage],
                                                    andText text: String,
                                                    loc: DVTDocumentLocation = DVTDocumentLocation(documentURLString: "",
@@ -520,6 +546,100 @@ note: use 'updatedDoSomething' instead\r doSomething()\r        ^~~~~~~~~~~\r   
                                       truncLargeIssues: false)
         let build = try parser.parse(activityLog: fakeLog)
         XCTAssertEqual(0, build.notes?.count ?? 0, "Notes should be empty")
+    }
+
+    /// Swift issue details are parsed lazily, so make sure an error still gets the detail
+    /// that belongs to its location.
+    func testSwiftErrorDetailsAreAttached() throws {
+        let timestamp = Date().timeIntervalSinceReferenceDate
+        let location = DVTTextDocumentLocation(documentURLString: "file:///project/file.swift",
+                                               timestamp: timestamp,
+                                               startingLineNumber: 10,
+                                               startingColumnNumber: 11,
+                                               endingLineNumber: 12,
+                                               endingColumnNumber: 13,
+                                               characterRangeEnd: 14,
+                                               characterRangeStart: 15,
+                                               locationEncoding: 16)
+        let errorMessage = IDEActivityLogMessage(title: "cannot find 'foo' in scope",
+                                                 shortTitle: "",
+                                                 timeEmitted: timestamp,
+                                                 rangeEndInSectionText: 18446744073709551615,
+                                                 rangeStartInSectionText: 0,
+                                                 subMessages: [],
+                                                 severity: 2,
+                                                 type: "com.apple.dt.IDE.diagnostic",
+                                                 location: location,
+                                                 categoryIdent: "Swift Compiler Error",
+                                                 secondaryLocations: [],
+                                                 additionalDescription: "")
+        let text = "/project/file.swift:11:12: error: cannot find 'foo' in scope\rlet x = foo()\r ^"
+        let fakeLog = getFakeIDEActivityLogWithMessages([errorMessage], andText: text, loc: location)
+        let build = try parser.parse(activityLog: fakeLog)
+
+        XCTAssertEqual(1, build.errorCount)
+        guard let error = build.errors?.first else {
+            XCTFail("Build's errors are empty")
+            return
+        }
+        XCTAssertEqual(NoticeType.swiftError, error.type)
+        XCTAssertEqual("/project/file.swift:11:12: error: cannot find 'foo' in scope\nlet x = foo()\n ^",
+                       error.detail)
+    }
+
+    /// `omitWarningsDetails` skips parsing the details, but the warning itself — and therefore
+    /// the issue count — has to survive.
+    func testOmitWarningsDetailsKeepsTheWarningWithoutItsDetail() {
+        let timestamp = Date().timeIntervalSinceReferenceDate
+        let location = DVTTextDocumentLocation(documentURLString: "file:///project/file.swift",
+                                               timestamp: timestamp,
+                                               startingLineNumber: 10,
+                                               startingColumnNumber: 11,
+                                               endingLineNumber: 12,
+                                               endingColumnNumber: 13,
+                                               characterRangeEnd: 14,
+                                               characterRangeStart: 15,
+                                               locationEncoding: 16)
+        let warningMessage = IDEActivityLogMessage(title: "unused variable 'x'",
+                                                   shortTitle: "",
+                                                   timeEmitted: timestamp,
+                                                   rangeEndInSectionText: 18446744073709551615,
+                                                   rangeStartInSectionText: 0,
+                                                   subMessages: [],
+                                                   severity: 1,
+                                                   type: "com.apple.dt.IDE.diagnostic",
+                                                   location: location,
+                                                   categoryIdent: "Swift Compiler Warning",
+                                                   secondaryLocations: [],
+                                                   additionalDescription: "")
+        let text = "/project/file.swift:11:12: warning: unused variable 'x'\rlet x = 1\r ^"
+        let section = getFakeLogSection(messages: [warningMessage], text: text, location: location)
+
+        let withDetails = Notice.parseFromLogSection(section,
+                                                     forType: .swiftCompilation,
+                                                     truncLargeIssues: false)
+        XCTAssertEqual(1, withDetails.getWarnings().count)
+        XCTAssertEqual("/project/file.swift:11:12: warning: unused variable 'x'\nlet x = 1\n ^",
+                       withDetails.getWarnings().first?.detail)
+
+        let withoutDetails = Notice.parseFromLogSection(section,
+                                                        forType: .swiftCompilation,
+                                                        truncLargeIssues: false,
+                                                        omitWarningsDetails: true)
+        XCTAssertEqual(withDetails.getWarnings().count, withoutDetails.getWarnings().count,
+                       "Omitting the details must not change how many warnings are reported")
+        XCTAssertEqual(withDetails.getWarnings().first?.title, withoutDetails.getWarnings().first?.title)
+        XCTAssertNil(withoutDetails.getWarnings().first?.detail)
+    }
+
+    /// A section with no log messages cannot hold an issue, so its text is never scanned.
+    func testSectionWithoutMessagesHasNoNotices() {
+        let section = getFakeLogSection(messages: [],
+                                        text: "/project/file.swift:11:12: error: cannot find 'foo' in scope",
+                                        location: DVTDocumentLocation(documentURLString: "", timestamp: 0))
+        XCTAssertTrue(Notice.parseFromLogSection(section,
+                                                 forType: .swiftCompilation,
+                                                 truncLargeIssues: false).isEmpty)
     }
 
     func testParseTruncateLargeIssues() throws {

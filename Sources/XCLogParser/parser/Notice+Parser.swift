@@ -28,11 +28,21 @@ extension Notice {
     /// - parameter logSection: An `IDEActivityLogSection`
     /// - parameter forType: The `DetailStepType` of the logSection
     /// - parameter truncLargeIssues: If true, if a task have more than 100 `Notice`, will be truncated to 100
+    /// - parameter omitWarningsDetails: If true, the details of Swift warnings are not parsed. The warnings
+    /// themselves are still reported, so issue counts are unaffected.
+    /// - parameter omitNotesDetails: If true, the details of notes are not parsed. The notes themselves are
+    /// still reported, so issue counts are unaffected.
     /// - returns: An Array of `Notice`
     public static func parseFromLogSection(_ logSection: IDEActivityLogSection,
                                            forType type: DetailStepType,
-                                           truncLargeIssues: Bool)
+                                           truncLargeIssues: Bool,
+                                           omitWarningsDetails: Bool = false,
+                                           omitNotesDetails: Bool = false)
         -> [Notice] {
+        // A section without log messages cannot produce a single `Notice`: clang warnings are zipped
+        // against `messages`, and every other notice is mapped from it. Returning here avoids scanning
+        // `logSection.text`, which is where the bulk of a log's bytes — and of this parse — sits.
+        guard !logSection.messages.isEmpty else { return [] }
         var logSection = logSection
         if truncLargeIssues && logSection.messages.count > 100 {
             logSection = self.logSectionWithTruncatedIssues(logSection: logSection)
@@ -45,8 +55,9 @@ extension Notice {
         let remainingLogMessages = logSection.messages.filter { message in
             return clangWarnings.contains { $0.title == message.title } == false
         }
-        // parse details for Swift issues
-        let swiftErrorDetails = parseSwiftIssuesDetailsByLocation(logSection.text)
+        // Parsing the Swift issue details walks the whole section text, so do it at most once per
+        // section and only when an issue that keeps its details is actually found.
+        let swiftIssues = LazySwiftIssueDetails(text: logSection.text)
         // we look for analyzer warnings, swift warnings, notes and errors
         return clangWarnings + remainingLogMessages.compactMap { message -> [Notice]? in
             if let resultMessage = message as? IDEActivityLogAnalyzerResultMessage {
@@ -65,21 +76,14 @@ extension Notice {
                                    detail: logSection.text) {
                 // Add the right details to Swift errors
                 if notice.type == NoticeType.swiftError || notice.type == .swiftWarning {
-                    // Special case, if Swiftc fails for a whole module,
-                    // we don't have location and the detail already has
-                    // enough information
-                    let noticeDetail = notice.detail ?? ""
-                    if noticeDetail.starts(with: "error:") == false {
-                        var errorLocation = notice.documentURL.replacingOccurrences(of: "file://", with: "")
-                        errorLocation += ":\(notice.startingLineNumber):\(notice.startingColumnNumber):"
-                        // do not report error in a file that it does not belong to (we'll ended
-                        // up having duplicated errors)
-                        if !logSection.location.documentURLString.isEmpty
-                            && logSection.location.documentURLString != notice.documentURL {
-                            return nil
-                        }
-                        notice = notice.with(detail: swiftErrorDetails[errorLocation])
+                    guard let detailed = self.withSwiftIssueDetail(notice,
+                                                                   logSection: logSection,
+                                                                   omitWarningsDetails: omitWarningsDetails,
+                                                                   omitNotesDetails: omitNotesDetails,
+                                                                   detail: swiftIssues.detail(atLocation:)) else {
+                        return nil
                     }
+                    notice = detailed
                 }
 
                 // Handle special cases
@@ -103,6 +107,42 @@ extension Notice {
         }.reduce([Notice]()) { flatten, notices -> [Notice] in
             flatten + notices
         }
+    }
+
+    /// Attaches to a Swift issue the detail parsed for its location.
+    /// - returns: The `Notice` with its detail, or nil when the issue belongs to a different file than
+    /// the one the log section compiled — reporting it would duplicate the issue.
+    private static func withSwiftIssueDetail(_ notice: Notice,
+                                             logSection: IDEActivityLogSection,
+                                             omitWarningsDetails: Bool,
+                                             omitNotesDetails: Bool,
+                                             detail: (String) -> String?) -> Notice? {
+        // Special case, if Swiftc fails for a whole module,
+        // we don't have location and the detail already has
+        // enough information
+        guard (notice.detail ?? "").starts(with: "error:") == false else {
+            return notice
+        }
+        // do not report error in a file that it does not belong to (we'll ended
+        // up having duplicated errors)
+        if !logSection.location.documentURLString.isEmpty
+            && logSection.location.documentURLString != notice.documentURL {
+            return nil
+        }
+        // Errors are always reported in full; warnings and notes only when the caller keeps
+        // their details.
+        let keepsDetails: Bool
+        switch notice.type {
+        case .swiftWarning: keepsDetails = !omitWarningsDetails
+        case .note: keepsDetails = !omitNotesDetails
+        default: keepsDetails = true
+        }
+        guard keepsDetails else {
+            return notice.with(detail: nil)
+        }
+        var errorLocation = notice.documentURL.replacingOccurrences(of: "file://", with: "")
+        errorLocation += ":\(notice.startingLineNumber):\(notice.startingColumnNumber):"
+        return notice.with(detail: detail(errorLocation))
     }
 
     /// Xcode reports the details of Swift errors and warnings as a mixed text with all the errors in a
@@ -219,5 +259,24 @@ extension Notice {
                                      categoryIdent: "Warning",
                                      secondaryLocations: [],
                                      additionalDescription: "")
+    }
+}
+
+/// Parses the Swift issue details of a log section at most once, and only if they are asked for.
+/// A log's bytes sit almost entirely in section texts, so parsing them upfront — for sections whose
+/// issues never need a detail — dominates the cost of parsing a build log.
+private final class LazySwiftIssueDetails {
+    private let text: String
+    private var detailsByLocation: [String: String]?
+
+    init(text: String) {
+        self.text = text
+    }
+
+    func detail(atLocation location: String) -> String? {
+        if detailsByLocation == nil {
+            detailsByLocation = Notice.parseSwiftIssuesDetailsByLocation(text)
+        }
+        return detailsByLocation?[location]
     }
 }
